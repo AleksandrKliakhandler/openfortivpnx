@@ -113,10 +113,13 @@ push notification to the mobile application. If this option is provided,
 authentication based on OTP will be used instead.
 .TP
 \fB\-\-ftm\-push\-otp\-prompt\fR
-Prompt for an OTP before falling back to FTM push.
+Send FTM push and prompt for an OTP fallback.
 When the server provides FTM push and no OTP was supplied through the
-configuration file or command line, openfortivpn will ask for an OTP.
-Leaving the OTP empty uses FTM push.
+configuration file or command line, openfortivpn will send an FTM push
+request immediately and ask for an OTP in parallel. If FTM push completes
+successfully, the OTP prompt is closed. If FTM push does not complete and an
+OTP was entered, openfortivpn retries the second authentication step with the
+OTP.
 .TP
 \fB\-\-realm=\fI<realm>\fR
 Connect to the specified authentication realm. Defaults to empty, which
@@ -348,7 +351,7 @@ username = foo
 .br
 # no\-ftm\-push = 1
 .br
-# Prompt for an OTP before using FTM push; leave OTP empty to use push
+# Send FTM push and prompt for an OTP fallback
 .br
 # ftm\-push\-otp\-prompt = 1
 .br

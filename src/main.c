@@ -124,7 +124,7 @@ PPPD_USAGE \
 "  --otp-prompt=<prompt>         Search for the OTP prompt starting with this string.\n" \
 "  --otp-delay=<delay>           Wait <delay> seconds before sending the OTP.\n" \
 "  --no-ftm-push                 Do not use FTM push if the server provides the option.\n" \
-"  --ftm-push-otp-prompt         Prompt for OTP before falling back to FTM push.\n" \
+"  --ftm-push-otp-prompt         Send FTM push and prompt for OTP fallback.\n" \
 "  --pinentry=<program>          Use the program to supply a secret instead of asking for it.\n" \
 "  --realm=<realm>               Use specified authentication realm.\n" \
 "  --ifname=<interface>          Bind to interface.\n" \

@@ -27,16 +27,25 @@
 
 #include <assert.h>
 #include <ctype.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
 
 /*
  * Fixed size of the buffer for outgoing HTTP requests.
  * Initial size of the buffer for incoming HTTP responses.
  */
 #define HTTP_BUFFER_SIZE 0x10000
+
+struct otp_prompt_child {
+	pid_t pid;
+	int fd;
+};
 
 
 /*
@@ -63,6 +72,106 @@ void url_encode(char *dest, const char *str)
 		str++;
 	}
 	*dest = '\0';
+}
+
+
+static void init_otp_prompt_child(struct otp_prompt_child *prompt)
+{
+	prompt->pid = -1;
+	prompt->fd = -1;
+}
+
+
+static void close_otp_prompt_child(struct otp_prompt_child *prompt)
+{
+	if (prompt->fd >= 0) {
+		close(prompt->fd);
+		prompt->fd = -1;
+	}
+
+	if (prompt->pid > 0) {
+		int status;
+
+		kill(-prompt->pid, SIGTERM);
+		kill(prompt->pid, SIGTERM);
+		for (int i = 0; i < 20; i++) {
+			pid_t ret = waitpid(prompt->pid, &status, WNOHANG);
+
+			if (ret == prompt->pid || (ret == -1 && errno == ECHILD))
+				break;
+			usleep(100000);
+		}
+		if (waitpid(prompt->pid, &status, WNOHANG) == 0) {
+			kill(-prompt->pid, SIGKILL);
+			kill(prompt->pid, SIGKILL);
+			waitpid(prompt->pid, &status, 0);
+		}
+		prompt->pid = -1;
+	}
+}
+
+
+static int read_otp_prompt_child(struct otp_prompt_child *prompt, char *otp)
+{
+	char buf[OTP_SIZE + 1];
+	ssize_t n;
+
+	if (prompt->fd < 0)
+		return 0;
+
+	n = read(prompt->fd, buf, OTP_SIZE);
+	if (n <= 0)
+		return 0;
+
+	buf[n] = '\0';
+	strncpy(otp, buf, OTP_SIZE);
+	otp[OTP_SIZE] = '\0';
+	return otp[0] != '\0';
+}
+
+
+static void start_otp_prompt_child(struct vpn_config *cfg,
+                                   struct otp_prompt_child *prompt)
+{
+	int fds[2];
+	pid_t pid;
+
+	init_otp_prompt_child(prompt);
+
+	if (pipe(fds) == -1) {
+		log_warn("Could not create OTP prompt pipe: %s\n", strerror(errno));
+		return;
+	}
+
+	pid = fork();
+	if (pid == -1) {
+		log_warn("Could not start OTP prompt: %s\n", strerror(errno));
+		close(fds[0]);
+		close(fds[1]);
+		return;
+	}
+
+	if (pid == 0) {
+		char otp[OTP_SIZE + 1] = {'\0'};
+		char hint[USERNAME_SIZE + 1 + REALM_SIZE + 1 + GATEWAY_HOST_SIZE + 5];
+
+		close(fds[0]);
+		setpgid(0, 0);
+		sprintf(hint, "%s_%s_%s_2fa",
+		        cfg->username, cfg->realm, cfg->gateway_host);
+		read_password(cfg->pinentry, hint,
+		              "Approve FortiToken push, or enter OTP code: ",
+		              otp, OTP_SIZE);
+		if (otp[0] != '\0')
+			write(fds[1], otp, strlen(otp));
+		close(fds[1]);
+		_exit(0);
+	}
+
+	close(fds[1]);
+	fcntl(fds[0], F_SETFL, fcntl(fds[0], F_GETFL, 0) | O_NONBLOCK);
+	prompt->pid = pid;
+	prompt->fd = fds[0];
 }
 
 
@@ -664,6 +773,10 @@ int auth_log_in(struct tunnel *tunnel)
 #undef OFV_MAX
 	char token[128], tokenresponse[256], tokenparams[320];
 	char action_url[1024] = { '\0' };
+	struct otp_prompt_child otp_prompt;
+	int ftm_push_with_otp_prompt = 0;
+
+	init_otp_prompt_child(&otp_prompt);
 	char *res = NULL;
 	uint32_t response_size;
 
@@ -793,23 +906,10 @@ int auth_log_in(struct tunnel *tunnel)
 			 * file or command line.
 			 */
 			if (cfg->ftm_push_otp_prompt) {
-				char hint[USERNAME_SIZE + 1 + REALM_SIZE + 1 + GATEWAY_HOST_SIZE + 5];
-
-				sprintf(hint, "%s_%s_%s_2fa",
-				        cfg->username, cfg->realm, cfg->gateway_host);
-				read_password(cfg->pinentry, hint,
-				              "Two-factor authentication token (leave empty to use FTM push): ",
-				              cfg->otp, OTP_SIZE);
+				start_otp_prompt_child(cfg, &otp_prompt);
+				ftm_push_with_otp_prompt = 1;
 			}
-
-			if (cfg->otp[0] == '\0') {
-				snprintf(tokenparams, sizeof(tokenparams), "ftmpush=1");
-			} else {
-				url_encode(tokenresponse, cfg->otp);
-				snprintf(tokenparams, sizeof(tokenparams),
-				         "code=%s&code2=&magic=%s",
-				         tokenresponse, magic);
-			}
+			snprintf(tokenparams, sizeof(tokenparams), "ftmpush=1");
 		} else {
 			if (cfg->otp[0] == '\0') {
 				// Interactively ask user for 2FA token
@@ -853,6 +953,27 @@ int auth_log_in(struct tunnel *tunnel)
 		}
 
 		ret = auth_get_cookie(tunnel, res, response_size);
+		if (ftm_push_with_otp_prompt) {
+			if (ret == 1) {
+				close_otp_prompt_child(&otp_prompt);
+			} else if (read_otp_prompt_child(&otp_prompt, cfg->otp)) {
+				log_info("FTM push did not complete; retrying with OTP.\n");
+				url_encode(tokenresponse, cfg->otp);
+				snprintf(tokenparams, sizeof(tokenparams),
+				         "code=%s&code2=&magic=%s",
+				         tokenresponse, magic);
+				snprintf(data, sizeof(data),
+				         "username=%s&realm=%s&reqid=%s&polid=%s&grp=%s&portal=%s&peer=%s&%s",
+				         username, realm, reqid, polid, group, portal, peer,
+				         tokenparams);
+				delay_otp(tunnel);
+				ret = http_request(tunnel, "POST", "/remote/logincheck",
+				                   data, &res, &response_size);
+				if (ret == 1 &&
+				    strncmp(res, "HTTP/1.1 200 OK\r\n", 17) == 0)
+					ret = auth_get_cookie(tunnel, res, response_size);
+			}
+		}
 	}
 
 	/*
@@ -868,6 +989,7 @@ int auth_log_in(struct tunnel *tunnel)
 	}
 
 end:
+	close_otp_prompt_child(&otp_prompt);
 	free(res);
 	return ret;
 }
