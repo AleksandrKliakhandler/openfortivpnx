@@ -47,6 +47,22 @@ struct otp_prompt_child {
 	int fd;
 };
 
+static volatile sig_atomic_t active_otp_prompt_pid = -1;
+
+
+static void handle_otp_prompt_signal(int sig)
+{
+	pid_t pid = active_otp_prompt_pid;
+
+	if (pid > 0) {
+		kill(-pid, SIGTERM);
+		kill(pid, SIGTERM);
+	}
+
+	signal(sig, SIG_DFL);
+	raise(sig);
+}
+
 
 /*
  * URL-encodes a string for HTTP requests.
@@ -92,6 +108,8 @@ static void close_otp_prompt_child(struct otp_prompt_child *prompt)
 	if (prompt->pid > 0) {
 		int status;
 
+		if (active_otp_prompt_pid == prompt->pid)
+			active_otp_prompt_pid = -1;
 		kill(-prompt->pid, SIGTERM);
 		kill(prompt->pid, SIGTERM);
 		for (int i = 0; i < 20; i++) {
@@ -171,6 +189,9 @@ static void start_otp_prompt_child(struct vpn_config *cfg,
 	close(fds[1]);
 	fcntl(fds[0], F_SETFL, fcntl(fds[0], F_GETFL, 0) | O_NONBLOCK);
 	prompt->pid = pid;
+	active_otp_prompt_pid = pid;
+	signal(SIGINT, handle_otp_prompt_signal);
+	signal(SIGTERM, handle_otp_prompt_signal);
 	prompt->fd = fds[0];
 }
 
@@ -905,7 +926,9 @@ int auth_log_in(struct tunnel *tunnel)
 			 * but only try this if the OTP is not provided by the config
 			 * file or command line.
 			 */
+			log_info("FortiGate offered FTM push; sending push request.\n");
 			if (cfg->ftm_push_otp_prompt) {
+				log_info("Starting OTP prompt as FTM push fallback.\n");
 				start_otp_prompt_child(cfg, &otp_prompt);
 				ftm_push_with_otp_prompt = 1;
 			}
@@ -933,6 +956,9 @@ int auth_log_in(struct tunnel *tunnel)
 			         tokenresponse, magic);
 		}
 
+		if (ftm_push_with_otp_prompt)
+			log_info("Waiting for FTM push approval or OTP fallback.\n");
+
 		snprintf(data, sizeof(data),
 		         "username=%s&realm=%s&reqid=%s&polid=%s&grp=%s&portal=%s&peer=%s&%s",
 		         username, realm, reqid, polid, group, portal, peer,
@@ -955,6 +981,7 @@ int auth_log_in(struct tunnel *tunnel)
 		ret = auth_get_cookie(tunnel, res, response_size);
 		if (ftm_push_with_otp_prompt) {
 			if (ret == 1) {
+				log_info("FTM push completed; closing OTP fallback prompt.\n");
 				close_otp_prompt_child(&otp_prompt);
 			} else if (read_otp_prompt_child(&otp_prompt, cfg->otp)) {
 				log_info("FTM push did not complete; retrying with OTP.\n");
@@ -972,6 +999,8 @@ int auth_log_in(struct tunnel *tunnel)
 				if (ret == 1 &&
 				    strncmp(res, "HTTP/1.1 200 OK\r\n", 17) == 0)
 					ret = auth_get_cookie(tunnel, res, response_size);
+			} else {
+				log_info("FTM push did not complete; no OTP fallback entered yet.\n");
 			}
 		}
 	}
